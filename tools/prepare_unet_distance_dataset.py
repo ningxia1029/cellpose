@@ -1,6 +1,11 @@
 """
 根据 Cellpose-SAM 导出结果，整理方案 B 训练数据集。
 
+本版本支持：
+1. 只给一个输入目录，脚本自动切分 train / val / test
+2. 按“样本组”切分，而不是按单帧切分，避免同一样本的多帧图像泄漏到不同数据集
+3. 同一组样本（例如 `0208_3_01_4__top01__...` / `0208_3_01_4__top03__...`）强制进入同一个 split
+
 固定输出目录结构：
 data/
   train/
@@ -9,19 +14,24 @@ data/
     distance_maps/
     debug/
   val/
+    images/
+    masks/
+    distance_maps/
+    debug/
   test/
-
-标签规则：
-1. `masks/` 直接来自 `semantic_masks`
-2. `distance_maps/` 由 `instance_masks` 逐实例计算距离变换后生成
-3. `debug/` 保存伪彩色距离图和叠加图，便于抽查
+    images/
+    masks/
+    distance_maps/
+    debug/
 """
 
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -33,13 +43,15 @@ import numpy as np
 
 # Cellpose-SAM 导出根目录：
 # 目录内应至少包含 images / semantic_masks / instance_masks
-TRAIN_SOURCE_ROOT = Path(r"E:\Tianlu\data_raw\cpsam_export_thr0.2_size5")
-VAL_SOURCE_ROOT = Path(r"")
-TEST_SOURCE_ROOT = Path(r"")
+SOURCE_ROOT = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3\cpsam_export_0.8_0.0_size120")
 
 # 目标训练工程的数据根目录：
 # 脚本会在这里自动创建 train / val / test 的 images、masks、distance_maps、debug
 TARGET_DATA_ROOT = Path(r"E:\Tianlu\cell\deeplearing_algorithm\third_process_segment\data")
+
+# 是否清空旧的 train / val / test 目录后再重新生成：
+# 推荐保持 True，避免你多次运行后旧文件残留造成混淆
+CLEAR_EXISTING_SPLITS = True
 
 # 是否拷贝原图到训练工程中
 COPY_IMAGES = True
@@ -50,25 +62,27 @@ SAVE_DEBUG = True
 # 调试叠加图中二值 mask 的阈值，仅用于可视化
 DEBUG_MASK_THRESHOLD = 0.5
 
+# 随机种子：
+# 为了保证每次切分结果稳定一致，默认固定一个随机种子
+RANDOM_SEED = 20260427
+
+# 组级别切分比例：
+# 当前默认使用 7:2:1，更适合你现在这种“样本组数还不算特别大”的情况。
+# 如果后续样本组明显变多（例如 >100 组），也可以改成 [8, 1, 1]。
+SPLIT_RATIO = [7, 2, 1]  # [train, val, test]
+
+# 样本组提取规则：
+# auto：优先按 "__top" 之前的前缀分组，例如
+#       0208_3_01_4__top01__8_0_endothelial_cells_0.79_image.tif
+#       -> 组键 0208_3_01_4__
+# manual_prefix：按 GROUP_PREFIX_SEPARATOR 手动切分
+GROUP_KEY_MODE = "auto"
+GROUP_PREFIX_SEPARATOR = "__top"
+
 
 def log(message: str) -> None:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {message}")
-
-
-def build_split_configs() -> List[Dict[str, Path]]:
-    split_configs: List[Dict[str, Path]] = []
-
-    if str(TRAIN_SOURCE_ROOT).strip() not in {"", "."}:
-        split_configs.append({"name": "train", "source_root": TRAIN_SOURCE_ROOT})
-    if str(VAL_SOURCE_ROOT).strip() not in {"", "."}:
-        split_configs.append({"name": "val", "source_root": VAL_SOURCE_ROOT})
-    if str(TEST_SOURCE_ROOT).strip() not in {"", "."}:
-        split_configs.append({"name": "test", "source_root": TEST_SOURCE_ROOT})
-
-    if not split_configs:
-        raise ValueError("请至少填写一个有效的 TRAIN_SOURCE_ROOT / VAL_SOURCE_ROOT / TEST_SOURCE_ROOT")
-    return split_configs
 
 
 def ensure_split_dirs(target_data_root: Path, split_name: str) -> Dict[str, Path]:
@@ -83,6 +97,20 @@ def ensure_split_dirs(target_data_root: Path, split_name: str) -> Dict[str, Path
     for path in output_dirs.values():
         path.mkdir(parents=True, exist_ok=True)
     return output_dirs
+
+
+def clear_existing_split_dirs(target_data_root: Path) -> None:
+    """
+    清理旧的 train / val / test 目录，避免重复运行后旧文件残留。
+    """
+    if not CLEAR_EXISTING_SPLITS:
+        return
+
+    for split_name in ["train", "val", "test"]:
+        split_root = target_data_root / split_name
+        if split_root.exists():
+            shutil.rmtree(split_root)
+            log(f"已清空旧目录: {split_root}")
 
 
 def normalize_to_uint8(image: np.ndarray) -> np.ndarray:
@@ -129,9 +157,43 @@ def blend_mask_overlay(
 
 
 def derive_sample_key_from_image_name(image_name: str) -> str:
+    """
+    从导出图像名中提取 sample key，用于找到对应的 semantic / instance 标签。
+    """
     stem = Path(image_name).stem
     if stem.endswith("_image"):
         return stem[:-6]
+    return stem
+
+
+def derive_group_key_from_image_name(image_name: str) -> str:
+    """
+    从图像名中提取“同一原始样本”的分组键。
+
+    例子：
+    - `0208_3_01_4__top01__8_0_endothelial_cells_0.79_image.tif`
+      -> `0208_3_01_4__`
+    - `0208_3_01_4__top03__15_0_endothelial_cells_0.78_image.tif`
+      -> `0208_3_01_4__`
+
+    这样可以确保同一个样本的多帧图像始终进入同一个 split，避免数据集污染。
+    """
+    stem = Path(image_name).stem
+    if stem.endswith("_image"):
+        stem = stem[:-6]
+
+    if GROUP_KEY_MODE == "manual_prefix":
+        if GROUP_PREFIX_SEPARATOR in stem:
+            return stem.split(GROUP_PREFIX_SEPARATOR)[0] + GROUP_PREFIX_SEPARATOR.replace("top", "")
+        return stem
+
+    # auto 模式：
+    # 1. 优先识别 "__top"
+    # 2. 识别失败时，再尝试按第一个双下划线之前切分
+    if "__top" in stem:
+        return stem.split("__top", 1)[0] + "__"
+    if "__" in stem:
+        return stem.split("__", 1)[0] + "__"
     return stem
 
 
@@ -143,7 +205,10 @@ def find_file_with_suffix(root_dir: Path, base_name: str, suffix_candidates: Lis
     return None
 
 
-def collect_samples(source_root: Path) -> List[Dict[str, Path]]:
+def collect_samples(source_root: Path) -> List[Dict[str, object]]:
+    """
+    收集样本，并为每个样本附带 group_key。
+    """
     images_dir = source_root / "images"
     semantic_masks_dir = source_root / "semantic_masks"
     instance_masks_dir = source_root / "instance_masks"
@@ -155,12 +220,13 @@ def collect_samples(source_root: Path) -> List[Dict[str, Path]]:
     if not instance_masks_dir.exists():
         raise FileNotFoundError(f"未找到 instance_masks 目录: {instance_masks_dir}")
 
-    samples: List[Dict[str, Path]] = []
+    samples: List[Dict[str, object]] = []
     for image_path in sorted(images_dir.iterdir()):
         if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
             continue
 
         sample_key = derive_sample_key_from_image_name(image_path.name)
+        group_key = derive_group_key_from_image_name(image_path.name)
         semantic_path = find_file_with_suffix(semantic_masks_dir, f"{sample_key}_semantic_mask", [".png", ".tif", ".tiff"])
         instance_path = find_file_with_suffix(instance_masks_dir, f"{sample_key}_instance_mask", [".png", ".tif", ".tiff"])
 
@@ -173,10 +239,75 @@ def collect_samples(source_root: Path) -> List[Dict[str, Path]]:
                 "image": image_path,
                 "semantic": semantic_path,
                 "instance": instance_path,
+                "sample_key": sample_key,
+                "group_key": group_key,
             }
         )
 
     return samples
+
+
+def split_group_keys(group_keys: List[str], split_ratio: List[int], random_seed: int) -> Dict[str, List[str]]:
+    """
+    按组键切分 train / val / test。
+
+    关键点：
+    1. 先对 group 做随机打乱
+    2. 再按比例切分
+    3. 如果组数足够，会尽量保证 val / test 至少各 1 组
+    """
+    if len(split_ratio) != 3:
+        raise ValueError("SPLIT_RATIO 必须是长度为 3 的列表，例如 [7, 2, 1]")
+    if any(value < 0 for value in split_ratio):
+        raise ValueError("SPLIT_RATIO 中不能出现负数")
+
+    unique_groups = sorted(set(group_keys))
+    if not unique_groups:
+        return {"train": [], "val": [], "test": []}
+
+    rng = random.Random(random_seed)
+    rng.shuffle(unique_groups)
+
+    total_groups = len(unique_groups)
+    ratio_sum = sum(split_ratio)
+    train_ratio, val_ratio, test_ratio = split_ratio
+
+    train_count = int(round(total_groups * train_ratio / ratio_sum))
+    val_count = int(round(total_groups * val_ratio / ratio_sum))
+    test_count = total_groups - train_count - val_count
+
+    # 组数足够时，尽量保证验证集和测试集各至少 1 组
+    if total_groups >= 3:
+        if val_count <= 0:
+            val_count = 1
+            train_count = max(train_count - 1, 1)
+        if test_count <= 0:
+            test_count = 1
+            train_count = max(train_count - 1, 1)
+
+    # 修正因 round 带来的越界
+    while train_count + val_count + test_count > total_groups:
+        if train_count >= max(val_count, test_count) and train_count > 1:
+            train_count -= 1
+        elif val_count >= test_count and val_count > 1:
+            val_count -= 1
+        elif test_count > 1:
+            test_count -= 1
+        else:
+            break
+
+    while train_count + val_count + test_count < total_groups:
+        train_count += 1
+
+    train_groups = unique_groups[:train_count]
+    val_groups = unique_groups[train_count:train_count + val_count]
+    test_groups = unique_groups[train_count + val_count:]
+
+    return {
+        "train": train_groups,
+        "val": val_groups,
+        "test": test_groups,
+    }
 
 
 def build_distance_map_from_instance_mask(instance_mask: np.ndarray) -> np.ndarray:
@@ -211,7 +342,7 @@ def save_float_tiff(save_path: Path, array: np.ndarray) -> None:
         raise RuntimeError(f"保存浮点 tif 失败: {save_path}")
 
 
-def process_single_sample(sample: Dict[str, Path], output_dirs: Dict[str, Path]) -> Dict[str, object]:
+def process_single_sample(sample: Dict[str, object], output_dirs: Dict[str, Path]) -> Dict[str, object]:
     image_path = sample["image"]
     semantic_path = sample["semantic"]
     instance_path = sample["instance"]
@@ -239,7 +370,7 @@ def process_single_sample(sample: Dict[str, Path], output_dirs: Dict[str, Path])
 
     distance_map = build_distance_map_from_instance_mask(instance_mask.astype(np.int32))
 
-    output_stem = image_path.stem
+    output_stem = Path(image_path).stem
     target_image_path = output_dirs["images"] / image_path.name
     target_mask_path = output_dirs["masks"] / f"{output_stem}.png"
     target_distance_path = output_dirs["distance_maps"] / f"{output_stem}.tif"
@@ -261,6 +392,8 @@ def process_single_sample(sample: Dict[str, Path], output_dirs: Dict[str, Path])
     foreground_pixels = int(np.count_nonzero(semantic_mask))
     return {
         "image_name": image_path.name,
+        "sample_key": sample["sample_key"],
+        "group_key": sample["group_key"],
         "shape_hw": list(image.shape[:2]),
         "instance_count": instance_count,
         "foreground_pixels": foreground_pixels,
@@ -269,42 +402,78 @@ def process_single_sample(sample: Dict[str, Path], output_dirs: Dict[str, Path])
     }
 
 
+def summarize_groups(samples: List[Dict[str, object]]) -> Dict[str, int]:
+    group_counter: Dict[str, int] = defaultdict(int)
+    for sample in samples:
+        group_counter[str(sample["group_key"])] += 1
+    return dict(sorted(group_counter.items(), key=lambda item: item[0]))
+
+
 def main() -> None:
-    split_configs = build_split_configs()
+    if not SOURCE_ROOT.exists():
+        raise FileNotFoundError(f"输入目录不存在: {SOURCE_ROOT}")
+
     TARGET_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    clear_existing_split_dirs(TARGET_DATA_ROOT)
 
-    manifest = {"target_data_root": str(TARGET_DATA_ROOT), "splits": {}}
+    log(f"开始扫描输入目录: {SOURCE_ROOT}")
+    all_samples = collect_samples(SOURCE_ROOT)
+    if not all_samples:
+        raise RuntimeError(f"未在目录中找到可用样本: {SOURCE_ROOT}")
 
-    for split_cfg in split_configs:
-        split_name = split_cfg["name"]
-        source_root = split_cfg["source_root"]
-        log(f"开始处理 split={split_name} | 来源目录: {source_root}")
+    group_summary = summarize_groups(all_samples)
+    split_group_map = split_group_keys(
+        group_keys=list(group_summary.keys()),
+        split_ratio=SPLIT_RATIO,
+        random_seed=RANDOM_SEED,
+    )
 
-        if not source_root.exists():
-            log(f"来源目录不存在，跳过 split={split_name}: {source_root}")
-            continue
+    log(f"共找到 {len(all_samples)} 帧样本，属于 {len(group_summary)} 个样本组")
+    log(
+        f"当前切分比例为 train:val:test = {SPLIT_RATIO[0]}:{SPLIT_RATIO[1]}:{SPLIT_RATIO[2]} | "
+        f"随机种子 = {RANDOM_SEED}"
+    )
+    log(
+        f"组数分配 -> train={len(split_group_map['train'])}, "
+        f"val={len(split_group_map['val'])}, test={len(split_group_map['test'])}"
+    )
 
+    manifest = {
+        "source_root": str(SOURCE_ROOT),
+        "target_data_root": str(TARGET_DATA_ROOT),
+        "split_ratio": SPLIT_RATIO,
+        "random_seed": RANDOM_SEED,
+        "group_key_mode": GROUP_KEY_MODE,
+        "group_prefix_separator": GROUP_PREFIX_SEPARATOR,
+        "num_total_frames": len(all_samples),
+        "num_total_groups": len(group_summary),
+        "splits": {},
+    }
+
+    for split_name in ["train", "val", "test"]:
+        allowed_groups = set(split_group_map[split_name])
+        split_samples = [sample for sample in all_samples if sample["group_key"] in allowed_groups]
         output_dirs = ensure_split_dirs(TARGET_DATA_ROOT, split_name)
-        samples = collect_samples(source_root)
-        if not samples:
-            log(f"split={split_name} 未找到可用样本，跳过")
-            continue
 
         split_records = []
-        for sample in samples:
+        for sample in split_samples:
             record = process_single_sample(sample, output_dirs)
             split_records.append(record)
             log(
                 f"已生成 {split_name} 样本: {record['image_name']} | "
-                f"尺寸={record['shape_hw']} | 实例数={record['instance_count']}"
+                f"group={record['group_key']} | 实例数={record['instance_count']}"
             )
 
         manifest["splits"][split_name] = {
-            "source_root": str(source_root),
-            "num_samples": len(split_records),
+            "num_frames": len(split_records),
+            "num_groups": len(allowed_groups),
+            "group_keys": sorted(allowed_groups),
             "records": split_records,
         }
-        log(f"split={split_name} 处理完成，共 {len(split_records)} 个样本")
+        log(
+            f"split={split_name} 处理完成 | "
+            f"frames={len(split_records)} | groups={len(allowed_groups)}"
+        )
 
     manifest_path = TARGET_DATA_ROOT / "dataset_manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

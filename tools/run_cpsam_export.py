@@ -32,13 +32,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 建议直接改成你自己的角膜内皮细胞灰度图目录。
 # 默认值：项目根目录下的 data/cornea_images
 # 可调范围：任意本地目录，只要里面放的是 2D 图像即可。
-INPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\output\roi_batch_selected_top2\segmentation_inputs")
+INPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3\segmentation_inputs")
 
 # 输出根目录：
 # 脚本会在该目录下自动创建 seg_npy / instance_masks / overlays / rois 等子目录。
 # 默认值：项目根目录下的 outputs/cpsam_export
 # 可调范围：任意本地可写目录。
-OUTPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\output\roi_batch_selected_top2\cpsam_export_0.8_0.0_size15")
+OUTPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3\cpsam_export_0.8_0.0_size120")
 
 # 待处理图像后缀：
 # 只会扫描这些后缀的文件，统一转小写后匹配。
@@ -85,7 +85,12 @@ MAX_SIZE_FRACTION = 0.4
 # 最小目标面积（像素）：
 # 小于该面积的实例会被过滤。
 # 默认值：15。对于噪点较多的图像可适当调大。
-MIN_SIZE = 15
+MIN_SIZE = 120
+
+# separated semantic 连通域最小面积（像素）：
+# 作用：在生成 separated_semantic_mask 后，移除轮廓挖空后残留的小碎片。
+# 默认值：15。仅作用于 separated_semantic_mask，不影响实例分割主流程。
+SEPARATED_SEMANTIC_MIN_COMPONENT_AREA = 120
 
 # 是否保存 GUI 兼容的 _seg.npy：
 # 推荐保持 True，这样后续你可以直接回到 Cellpose GUI 中复查与修订。
@@ -618,6 +623,17 @@ def save_separated_semantic_mask_file(masks: np.ndarray, outline_mask: np.ndarra
     """
 
     separated_mask = ((masks > 0) & (outline_mask == 0)).astype(np.uint8) * 255
+    # 额外做一轮连通域面积过滤，移除轮廓挖空后残留的小碎片。
+    separated_binary = (separated_mask > 0).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        separated_binary, connectivity=8)
+    filtered_mask = np.zeros_like(separated_mask, dtype=np.uint8)
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area >= SEPARATED_SEMANTIC_MIN_COMPONENT_AREA:
+            filtered_mask[labels == label] = 255
+
+    separated_mask = filtered_mask
     save_path = output_stub.with_name(output_stub.name + "_separated_semantic_mask.png")
     io.imsave(str(save_path), separated_mask)
     return save_path
@@ -907,6 +923,8 @@ def print_config() -> None:
     print(f"  dynamics niter: {NITER}")
     print(f"  max_size_fraction: {MAX_SIZE_FRACTION}")
     print(f"  min_size: {MIN_SIZE}")
+    print("  separated_semantic_min_component_area: "
+          f"{SEPARATED_SEMANTIC_MIN_COMPONENT_AREA}")
     print(f"  保存_seg.npy: {SAVE_SEG_NPY}")
     print(f"  保存实例mask: {SAVE_INSTANCE_MASK}")
     print(f"  保存实例mask预览图: {SAVE_INSTANCE_MASK_PREVIEW}")

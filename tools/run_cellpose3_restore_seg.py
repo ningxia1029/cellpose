@@ -27,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 默认值：项目根目录下 outputs/cellpose3_demo_inputs。
 # 可调范围：任意本地目录；当前脚本默认只扫描这一层目录，不递归子目录。
 
-INPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\output\roi_batch_selected_top2\segmentation_inputs")
+INPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\ROI\0208_3_01_9\crops")
 
 # 输出根目录：
 # 用途：保存本次 cellpose3 恢复与分割结果。
