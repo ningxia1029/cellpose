@@ -10,16 +10,19 @@
 data/
   train/
     images/
+    original_frames/
     masks/
     distance_maps/
     debug/
   val/
     images/
+    original_frames/
     masks/
     distance_maps/
     debug/
   test/
     images/
+    original_frames/
     masks/
     distance_maps/
     debug/
@@ -46,7 +49,8 @@ import numpy as np
 SOURCE_ROOT = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3\cpsam_export_0.8_0.0_size120")
 
 # 目标训练工程的数据根目录：
-# 脚本会在这里自动创建 train / val / test 的 images、masks、distance_maps、debug
+# 脚本会在这里自动创建 train / val / test 的
+# images、original_frames、masks、distance_maps、debug
 TARGET_DATA_ROOT = Path(r"E:\Tianlu\cell\deeplearing_algorithm\third_process_segment\data")
 
 # 是否清空旧的 train / val / test 目录后再重新生成：
@@ -55,6 +59,12 @@ CLEAR_EXISTING_SPLITS = True
 
 # 是否拷贝原图到训练工程中
 COPY_IMAGES = True
+
+# 是否额外保存 selected_original_frames 中的原始帧：
+# 推荐保持 True，这样后续你可以同时拿到：
+# 1. Cellpose 推理时真正输入的 ROI 图（images）
+# 2. 对应挑选出的原始帧图（original_frames）
+COPY_SELECTED_ORIGINAL_FRAMES = True
 
 # 是否保存调试图
 SAVE_DEBUG = True
@@ -90,6 +100,7 @@ def ensure_split_dirs(target_data_root: Path, split_name: str) -> Dict[str, Path
     output_dirs = {
         "root": split_root,
         "images": split_root / "images",
+        "original_frames": split_root / "original_frames",
         "masks": split_root / "masks",
         "distance_maps": split_root / "distance_maps",
         "debug": split_root / "debug",
@@ -205,6 +216,24 @@ def find_file_with_suffix(root_dir: Path, base_name: str, suffix_candidates: Lis
     return None
 
 
+def resolve_selected_original_frames_dir(source_root: Path) -> Optional[Path]:
+    """
+    查找 selected_original_frames 目录。
+
+    兼容两种常见结构：
+    1. SOURCE_ROOT / selected_original_frames
+    2. SOURCE_ROOT.parent / selected_original_frames
+    """
+    candidates = [
+        source_root / "selected_original_frames",
+        source_root.parent / "selected_original_frames",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
 def collect_samples(source_root: Path) -> List[Dict[str, object]]:
     """
     收集样本，并为每个样本附带 group_key。
@@ -212,6 +241,7 @@ def collect_samples(source_root: Path) -> List[Dict[str, object]]:
     images_dir = source_root / "images"
     semantic_masks_dir = source_root / "semantic_masks"
     instance_masks_dir = source_root / "instance_masks"
+    selected_original_frames_dir = resolve_selected_original_frames_dir(source_root)
 
     if not images_dir.exists():
         raise FileNotFoundError(f"未找到 images 目录: {images_dir}")
@@ -229,6 +259,13 @@ def collect_samples(source_root: Path) -> List[Dict[str, object]]:
         group_key = derive_group_key_from_image_name(image_path.name)
         semantic_path = find_file_with_suffix(semantic_masks_dir, f"{sample_key}_semantic_mask", [".png", ".tif", ".tiff"])
         instance_path = find_file_with_suffix(instance_masks_dir, f"{sample_key}_instance_mask", [".png", ".tif", ".tiff"])
+        original_frame_path = None
+        if selected_original_frames_dir is not None:
+            original_frame_path = find_file_with_suffix(
+                selected_original_frames_dir,
+                sample_key,
+                [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"],
+            )
 
         if semantic_path is None or instance_path is None:
             log(f"跳过样本，缺少 semantic 或 instance 标签: {image_path.name}")
@@ -239,6 +276,7 @@ def collect_samples(source_root: Path) -> List[Dict[str, object]]:
                 "image": image_path,
                 "semantic": semantic_path,
                 "instance": instance_path,
+                "original_frame": original_frame_path,
                 "sample_key": sample_key,
                 "group_key": group_key,
             }
@@ -346,6 +384,7 @@ def process_single_sample(sample: Dict[str, object], output_dirs: Dict[str, Path
     image_path = sample["image"]
     semantic_path = sample["semantic"]
     instance_path = sample["instance"]
+    original_frame_path = sample["original_frame"]
 
     image = cv2.imread(str(image_path), cv2.IMREAD_UNCHANGED)
     semantic_mask = cv2.imread(str(semantic_path), cv2.IMREAD_GRAYSCALE)
@@ -372,11 +411,16 @@ def process_single_sample(sample: Dict[str, object], output_dirs: Dict[str, Path
 
     output_stem = Path(image_path).stem
     target_image_path = output_dirs["images"] / image_path.name
+    target_original_frame_path = None
     target_mask_path = output_dirs["masks"] / f"{output_stem}.png"
     target_distance_path = output_dirs["distance_maps"] / f"{output_stem}.tif"
 
     if COPY_IMAGES:
         shutil.copy2(str(image_path), str(target_image_path))
+
+    if COPY_SELECTED_ORIGINAL_FRAMES and original_frame_path is not None:
+        target_original_frame_path = output_dirs["original_frames"] / Path(original_frame_path).name
+        shutil.copy2(str(original_frame_path), str(target_original_frame_path))
 
     cv2.imwrite(str(target_mask_path), semantic_mask)
     save_float_tiff(target_distance_path, distance_map)
@@ -392,6 +436,7 @@ def process_single_sample(sample: Dict[str, object], output_dirs: Dict[str, Path
     foreground_pixels = int(np.count_nonzero(semantic_mask))
     return {
         "image_name": image_path.name,
+        "original_frame_name": Path(original_frame_path).name if original_frame_path is not None else None,
         "sample_key": sample["sample_key"],
         "group_key": sample["group_key"],
         "shape_hw": list(image.shape[:2]),
@@ -399,6 +444,7 @@ def process_single_sample(sample: Dict[str, object], output_dirs: Dict[str, Path
         "foreground_pixels": foreground_pixels,
         "distance_min": float(distance_map.min()),
         "distance_max": float(distance_map.max()),
+        "saved_original_frame": target_original_frame_path is not None,
     }
 
 
@@ -417,6 +463,13 @@ def main() -> None:
     clear_existing_split_dirs(TARGET_DATA_ROOT)
 
     log(f"开始扫描输入目录: {SOURCE_ROOT}")
+    original_frames_dir = resolve_selected_original_frames_dir(SOURCE_ROOT)
+    if COPY_SELECTED_ORIGINAL_FRAMES:
+        if original_frames_dir is not None:
+            log(f"已找到原始帧目录: {original_frames_dir}")
+        else:
+            log("未找到 selected_original_frames 目录，本次不会额外保存 original_frames")
+
     all_samples = collect_samples(SOURCE_ROOT)
     if not all_samples:
         raise RuntimeError(f"未在目录中找到可用样本: {SOURCE_ROOT}")
