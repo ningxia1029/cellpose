@@ -46,7 +46,7 @@ import numpy as np
 
 # Cellpose-SAM 导出根目录：
 # 目录内应至少包含 images / semantic_masks / instance_masks
-SOURCE_ROOT = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3\cpsam_export_0.8_0.0_size120")
+SOURCE_ROOT = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3_v3\cpsam_export_0_0.0_size120")
 
 # 目标训练工程的数据根目录：
 # 脚本会在这里自动创建 train / val / test 的

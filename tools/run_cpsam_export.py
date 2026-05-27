@@ -32,13 +32,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 建议直接改成你自己的角膜内皮细胞灰度图目录。
 # 默认值：项目根目录下的 data/cornea_images
 # 可调范围：任意本地目录，只要里面放的是 2D 图像即可。
-INPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3\segmentation_inputs")
-
+INPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3_v3\segmentation_inputs")
 # 输出根目录：
 # 脚本会在该目录下自动创建 seg_npy / instance_masks / overlays / rois 等子目录。
 # 默认值：项目根目录下的 outputs/cpsam_export
 # 可调范围：任意本地可写目录。
-OUTPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3\cpsam_export_0.8_0.0_size120")
+OUTPUT_DIR = Path(r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3_v3\cpsam_export_0_0.0_size120")
 
 # 待处理图像后缀：
 # 只会扫描这些后缀的文件，统一转小写后匹配。
@@ -48,7 +47,7 @@ IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
 # 分割模型名称：
 # 默认使用 Cellpose-SAM 的官方模型 cpsam。
 # 如果后续你训练了自定义 Cellpose 模型，也可以改成模型名或完整模型路径。
-MODEL_NAME = "cpsam"
+MODEL_NAME = r"E:\Tianlu\cell\deeplearing_algorithm\second_process_enhanced\roi_batch_selected_top3_v3\segmentation_inputs\models\cpsam_20260525_161131"
 
 # 是否优先使用 GPU：
 # True 表示优先尝试 CUDA / MPS；False 表示强制使用 CPU。
@@ -63,7 +62,7 @@ BATCH_SIZE = 8
 # flow_threshold：
 # 作用：控制 Cellpose 对流场一致性的过滤强度。
 # 默认值：0.4。调低通常会保留更多目标，调高会更严格。
-FLOW_THRESHOLD = 0.8
+FLOW_THRESHOLD = 0
 
 # cellprob_threshold：
 # 作用：控制细胞概率阈值。
